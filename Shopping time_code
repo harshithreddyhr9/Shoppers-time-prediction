@@ -1,0 +1,382 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Dec 25 16:28:22 2018
+
+@author: Sai Harshith Reddy Gaddam
+"""    
+
+import pandas as pd
+import numpy as np
+
+
+import pandas as pd
+import numpy as np
+#import os
+import xgboost as xgb
+from sklearn.cross_validation import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn import metrics
+from sklearn import preprocessing
+from hyperopt import hp
+from hyperopt import fmin, hp, STATUS_OK, space_eval,tpe, STATUS_FAIL
+from sklearn.preprocessing import StandardScaler
+import sys
+import operator
+from numpy import nan
+from sklearn.externals import joblib
+
+# reading the train_trips, test_trips and order_items files
+
+train_trips = pd.read_csv("/Users/Harshith/Downloads/instacart-picking-time-challenge-data/train_trips.csv")
+test_trips = pd.read_csv("/Users/Harshith/Downloads/instacart-picking-time-challenge-data/test_trips.csv")
+order_items = pd.read_csv("/Users/Harshith/Downloads/instacart-picking-time-challenge-data/order_items.csv")
+
+
+#preprocessing and feature engineering for train and test datasets
+
+# trail 1 - creating a sparse dataset by creating department columns wise quatity
+grouped = order_items.groupby(['trip_id','department_name'], as_index=False).agg({"quantity": "sum"})
+grouped_pivot = grouped.pivot(index='trip_id', columns='department_name', values='quantity')
+# filling NaN values with 0
+grouped_pivot = grouped_pivot.fillna(0)
+grouped_pivot['trip_id'] = grouped_pivot.index
+
+# number of unique items shopped
+grouped_items = order_items.groupby(['trip_id'], as_index=False).agg({"item_id": "count"})
+#number of unique depts visted
+grouped_dept = pd.DataFrame(order_items.groupby('trip_id').department_name.nunique())
+grouped_dept['trip_id'] = grouped_dept.index
+
+#merging all the files for train
+grouped_t_pivot = pd.merge(train_trips, grouped_pivot, on='trip_id', how='left')
+grouped_t_pivot_item = pd.merge(grouped_t_pivot, grouped_items, on='trip_id', how='left')
+train = pd.merge(grouped_t_pivot_item, grouped_dept, on='trip_id', how='left')
+
+#merging all the files for test
+grouped_t_pivot_test = pd.merge(test_trips, grouped_pivot, on='trip_id', how='left')
+grouped_t_pivot_item_test = pd.merge(grouped_t_pivot_test, grouped_items, on='trip_id', how='left')
+test = pd.merge(grouped_t_pivot_item_test, grouped_dept, on='trip_id', how='left')
+
+# trail 2 - only with the counts and without creating sparse dataset
+
+grouped = order_items.groupby(['trip_id'], as_index=False).agg({"quantity": "sum"})
+# number of unique items shopped
+grouped_items = order_items.groupby(['trip_id'], as_index=False).agg({"item_id": "count"})
+#number of unique depts visted
+grouped_dept = pd.DataFrame(order_items.groupby('trip_id').department_name.nunique())
+grouped_dept['trip_id'] = grouped_dept.index
+
+grouped_t_pivot = pd.merge(train_trips, grouped, on='trip_id', how='left')
+grouped_t_pivot_item = pd.merge(grouped_t_pivot, grouped_items, on='trip_id', how='left')
+train = pd.merge(grouped_t_pivot_item, grouped_dept, on='trip_id', how='left')
+
+grouped_t_pivot_test = pd.merge(test_trips, grouped, on='trip_id', how='left')
+grouped_t_pivot_item_test = pd.merge(grouped_t_pivot_test, grouped_items, on='trip_id', how='left')
+test = pd.merge(grouped_t_pivot_item_test, grouped_dept, on='trip_id', how='left')
+
+
+# creating time features
+train['lpep_pickup_datetime'] = pd.to_datetime(train.shopping_started_at)
+train['Lpep_dropoff_datetime'] = pd.to_datetime(train.shopping_ended_at)
+train['Trip_duration'] = (train['Lpep_dropoff_datetime'] - train['lpep_pickup_datetime'])/np.timedelta64(1, 's')
+     
+train['lpep_pickup_datetime'] = pd.to_datetime(train.lpep_pickup_datetime)
+train.loc[:, 'pickup_wkday'] = train['lpep_pickup_datetime'].dt.weekday
+train.loc[:, 'pickup_weekofyear'] = train['lpep_pickup_datetime'].dt.weekofyear
+train.loc[:, 'pickup_hr'] = train['lpep_pickup_datetime'].dt.hour
+
+# avg # of items per dept in a trip
+train['avg_items_dept'] = train['item_id']/train['department_name']
+
+
+
+
+# test dataset feature engineering
+test['avg_items_dept'] = test['item_id']/train['department_name']
+test['lpep_pickup_datetime'] = pd.to_datetime(test.shopping_started_at)
+test['lpep_pickup_datetime'] = pd.to_datetime(test.lpep_pickup_datetime)
+test.loc[:, 'pickup_wkday'] = test['lpep_pickup_datetime'].dt.weekday
+test.loc[:, 'pickup_weekofyear'] = test['lpep_pickup_datetime'].dt.weekofyear
+test.loc[:, 'pickup_hr'] = test['lpep_pickup_datetime'].dt.hour
+
+# No null values in the dataset   
+null_data = train[train.isnull().any(axis=1)]   
+
+# droping the columns not required for model building
+train.drop(['trip_id','shopper_id','shopping_started_at','shopping_ended_at','lpep_pickup_datetime','Lpep_dropoff_datetime'],axis=1,inplace=True) 
+test.drop(['trip_id','shopper_id','shopping_started_at','lpep_pickup_datetime'],axis=1,inplace=True) 
+
+# converitng numeric variables to categorical
+
+train['pickup_hr'] = train.pickup_hr.astype('category')
+train['pickup_weekofyear'] = train.pickup_weekofyear.astype('category')
+train['pickup_wkday'] = train.pickup_wkday.astype('category')
+train['store_id'] = train.store_id.astype('category')
+train['fulfillment_model'] = train.fulfillment_model.astype('category')
+
+test['pickup_hr'] = test.pickup_hr.astype('category')
+test['pickup_weekofyear'] = test.pickup_weekofyear.astype('category')
+test['pickup_wkday'] = test.pickup_wkday.astype('category')
+test['store_id'] = test.store_id.astype('category')
+test['fulfillment_model'] = test.fulfillment_model.astype('category')
+
+
+PROJECT_PATH = '/Users/Harshith/Downloads/instacart-picking-time-challenge-data'
+
+class Duration_prediction:
+    def __init__(self):
+        '''
+        Constructor
+        '''
+        self.x_train=None
+        self.x_valid=None
+        self.y_train=None
+        self.y_valid=None
+        self.dtrain=None
+        self.dvalid=None
+        self.dfulltrain=None        
+        self.x_fulltrain=None
+        self.y_fulltrain=None
+        self.lossfn_val=-1
+        self.modelToTrain=None
+        self.param_space_xgboost = {
+                'n_estimators' : hp.quniform('n_estimators',100, 500, 1),
+                'eta' : hp.quniform('eta', 0.025, 0.5, 0.025),
+                'max_depth' : hp.quniform('max_depth', 5,20, 1),
+                'min_child_weight' : hp.quniform('min_child_weight', 5, 100, 5),
+                'subsample' : hp.quniform('subsample', 0.5, 1, 0.05),
+                'gamma' : hp.quniform('gamma', 0.5, 1, 0.05),
+                'colsample_bytree' : hp.quniform('colsample_bytree', 0.5, 1, 0.05),    
+                'eval_metric': 'rmse',
+                'objective': 'reg:linear',
+                'nthread' : 4,
+                'silent' : 1,
+                'random_state':123
+                
+                 }
+        self.param_space_rf = {
+                'n_estimators' : hp.quniform('n_estimators',100, 500, 1),
+                'criterion' : 'mse', # Only available evalaution metric
+                'max_depth' : hp.quniform('max_depth', 5,20, 1),                
+                'max_features':hp.quniform('max_features', 0.5, 1, 0.05),
+                'n_jobs' : -1,
+                'verbose':0,                
+                'random_state':123
+                
+                 }
+        
+
+    ### function to evaluate the model and give the RMSE error ####
+    def fnevaluate_model(self,actual,predicted):   
+            
+            error=metrics.mean_squared_error(actual, predicted)
+            return round(100*error**0.5,3)
+    
+    ### function to create dummies for categorical attributes ####
+    def fnOneHotEncoding(self,dataset):       
+        return pd.get_dummies(dataset, prefix_sep = "_")
+    
+    ### function to fit an XGboost/random Forest model with given parameters ####
+    def fn_fitModel(self,params):
+        print "Training with params : "
+        print params
+        if self.modelToTrain=="xgboost":
+            num_round = int(params['n_estimators'])
+            del params['n_estimators']  
+        
+        # If in Hyper parameter Tune mode     
+        if self.lossfn_val is not None:
+            if self.modelToTrain=="xgboost":
+                
+                # construct train and valid data in xgb matrix format
+                self.dtrain = xgb.DMatrix(self.x_train, label=self.y_train,missing=nan)
+                self.dvalid = xgb.DMatrix(self.x_valid, label=self.y_valid,missing=nan)
+                # train the model
+                
+                model = xgb.train(params, self.dtrain, num_round)
+            else:
+                params['max_features']=int(float(params['max_features'])*self.x_train.shape[1])
+                params['n_estimators']=int(params['n_estimators'])
+                params['max_depth']=int(params['max_depth'])
+                model=RandomForestRegressor(**params)
+                model.fit(self.x_train,self.y_train)
+            
+        # If building the model on the full data based on the best parameters
+        else:
+            if self.modelToTrain=="xgboost":
+                print "Before Data Conversion"
+                # construct train and valid data in xgb matrix format
+                self.dfulltrain = xgb.DMatrix(self.x_fulltrain, label=self.y_fulltrain,missing=nan)
+                # train the model
+                print "Training full model"
+                model = xgb.train(params, self.dfulltrain, num_round)
+                print "Done with model"
+            else:
+                params['max_features']=int(float(params['max_features'])*self.x_train.shape[1])
+                params['n_estimators']=int(params['n_estimators'])
+                params['max_depth']=int(params['max_depth'])
+                model=RandomForestRegressor(**params)
+                model.fit(self.x_fulltrain,self.y_fulltrain)
+        return model 
+    
+    
+    ### function to get the loss function(to minimize) on each trial of Hyper parameter tuning
+    def fn_scoreModel(self,params): 
+        model=self.fn_fitModel(params)
+
+        if self.modelToTrain=="xgboost":
+            train_preds=model.predict(self.dtrain) 
+            valid_preds=model.predict(self.dvalid)
+        else:
+            train_preds=model.predict(self.x_train) 
+            valid_preds=model.predict(self.x_valid)
+        
+         # Evaluate the model on both train and validation data
+        train_error=self.fnevaluate_model(self.y_train,train_preds)
+        valid_error=self.fnevaluate_model(self.y_valid,valid_preds)
+        loss_val=valid_error*abs(train_error-valid_error)
+        self.lossfn_val=valid_error
+        print "loss:{0}".format(loss_val)
+        print "Train Error:{0}".format(train_error)
+        print "Validation Error:{0}".format(valid_error)           
+        return {'loss':loss_val,'status': STATUS_OK} 
+    
+    ### function to run Hyper parameter tuning ##
+    def tune_model(self):
+        
+        # Intialize the Parameter space based on the model(Xgboost or Random Forest model) to be built
+        if self.modelToTrain=="xgboost":
+            param_space=self.param_space_xgboost
+        else:
+            param_space=self.param_space_rf
+
+        best = fmin(self.fn_scoreModel, param_space, algo=tpe.suggest,max_evals=5)
+        best_params=space_eval(param_space,best)       
+        return best_params   
+    
+    ### Main function to build the best model on the Train data ###
+    def fn_CreateModel(self,train_data,target_attr):
+        try:
+            
+            #train_data = traindata
+            
+            # Get the Target attribute values  and the independent attributes dataset
+            targetVar = train_data[target_attr]
+            
+            # drop the target attribute from the train dataset
+            dataset = train_data.drop(target_attr,axis=1)
+            
+            #One Hot encode the data set for categorical attributes          
+            dataset = self.fnOneHotEncoding(dataset) 
+            dummyAttrNames=dataset.columns
+            
+            # Split the train data into Train set and Validation set(Train:70% Validation:30%)
+            self.x_train, self.x_valid, self.y_train, self.y_valid = train_test_split(
+            dataset, targetVar, test_size=0.3, random_state=123)        
+            
+            # Tune the models using Hyper optimization of model parameters with 10 runs
+            best_params=self.tune_model()
+            
+            self.x_fulltrain=dataset.values
+            self.y_fulltrain=targetVar.values
+            
+            # set the value to None to re-use the same fit function
+            self.lossfn_val=None
+            # Fit the model using the best set of parameters found using Hyper parameter Optimization
+            best_model=self.fn_fitModel(best_params)           
+                  
+            
+            # Save the model to a text file(serialize)
+            if self.modelToTrain=="xgboost":     
+                          
+                best_model.save_model(PROJECT_PATH+"/xgb_model.txt") 
+                
+            else:
+                joblib.dump(best_model,PROJECT_PATH+"/rf_model.txt",compress=9)
+            print "Model Saved"    
+        except Exception as e:
+            print e 
+            return None
+        return dummyAttrNames
+
+    ### function to get the predictions on the Test data ###
+    def fn_predict_testdata(self,test_data,attr_names):
+        # One Hot encode the data set for categorical attributes          
+        test_data = self.fnOneHotEncoding(test_data) 
+        
+        # Maintain the same columns for the test dataset as the train dataset
+        missingCols = list(set(attr_names) - set(test_data.columns))
+        if len(missingCols) > 0:
+            for col in missingCols:
+                test_data[col] = 0
+        test_data = test_data[attr_names]
+        
+        if self.modelToTrain=="xgboost":
+            # Extract the Xgboost model from the saved path
+            xgbModel=xgb.Booster(model_file=PROJECT_PATH+"/xgb_model.txt")        
+            # Transform the test data to xgboost matrix format                      
+            dtestdata = xgb.DMatrix(test_data, label = np.zeros(len(test_data)))
+            # Get the predictions
+            predictions = np.array(xgbModel.predict(dtestdata), dtype = "float64")
+        else:
+            rfModel=joblib.load(PROJECT_PATH+"/rf_model.txt")
+            predictions=rfModel.predict(test_data)      
+        
+    
+        return predictions
+
+
+## Driver Method
+def main():
+    
+    #reading the dataset
+    dataset = train 
+      
+    # creating the instance of the class Tip_percentage_prediction       
+    tipobj=Duration_prediction()
+    
+    
+    #creating train and test dataset split
+    msk = np.random.rand(len(train)) < 0.8
+    traindata = train[msk]
+    testdata = train[~msk]
+    
+    # printing the size of traindata and testdata
+    print traindata.shape
+    print testdata.shape
+    
+    # Set the Target attribute
+    target_attr = 'Trip_duration'
+    
+    # Model to run 
+    tipobj.modelToTrain="rf"
+    
+    # Create the best model on the train data
+    traindata = traindata.dropna(how='any')       
+    attr_names=tipobj.fn_CreateModel(traindata,target_attr)
+
+
+    ## Predictions on Hold out Dataset
+    predictions=tipobj.fn_predict_testdata(test, attr_names)
+    predictions=np.round(predictions,3)
+    predictions = pd.DataFrame(predictions)            
+    predictions.to_csv(PROJECT_PATH+"predictions_rf.csv",index=False,header=False)
+    print "Done"
+
+
+if __name__ == "__main__": main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
